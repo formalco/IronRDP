@@ -29,6 +29,7 @@ pub use gfx::*;
 pub use handler::*;
 #[cfg(feature = "helper")]
 pub use helper::*;
+pub use ironrdp_acceptor::CredentialProvider;
 pub use server::*;
 pub use sound::*;
 
