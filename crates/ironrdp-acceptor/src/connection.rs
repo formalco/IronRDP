@@ -1,4 +1,5 @@
 use core::mem;
+use std::sync::Arc;
 
 use ironrdp_connector::{
     encode_x224_packet, general_err, reason_err, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
@@ -19,6 +20,7 @@ use tracing::{debug, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::FinalizationSequence;
+use crate::credssp::CredentialProvider;
 use crate::util::{self, wrap_share_data};
 
 const IO_CHANNEL_ID: u16 = 1003;
@@ -34,6 +36,7 @@ pub struct Acceptor {
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
+    pub(crate) credential_provider: Option<Arc<dyn CredentialProvider>>,
     reactivation: bool,
 }
 
@@ -64,8 +67,13 @@ impl Acceptor {
             static_channels: StaticChannelSet::new(),
             saved_for_reactivation: Default::default(),
             creds,
+            credential_provider: None,
             reactivation: false,
         }
+    }
+
+    pub fn set_credential_provider(&mut self, provider: Arc<dyn CredentialProvider>) {
+        self.credential_provider = Some(provider);
     }
 
     pub fn new_deactivation_reactivation(
@@ -105,6 +113,7 @@ impl Acceptor {
             static_channels,
             saved_for_reactivation,
             creds: consumed.creds,
+            credential_provider: consumed.credential_provider,
             reactivation: true,
         })
     }
@@ -530,7 +539,14 @@ impl Sequence for Acceptor {
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;
 
-                    if self.creds.as_ref() != Some(&creds) {
+                    let valid = if let Some(provider) = &self.credential_provider {
+                        let domain = creds.domain.as_deref();
+                        provider.get_credentials(&creds.username, domain).contains(&creds)
+                    } else {
+                        self.creds.as_ref() == Some(&creds)
+                    };
+
+                    if !valid {
                         // FIXME: How authorization should be denied with standard RDP security?
                         // Since standard RDP security is not a priority, we just send a ServerDeniedConnection ServerSetErrorInfo PDU.
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(

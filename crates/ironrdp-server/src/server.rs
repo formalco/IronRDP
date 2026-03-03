@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::echo::{build_echo_request, EchoDvcBridge, EchoServerHandle, EchoServerMessage};
 use anyhow::{bail, Context as _, Result};
-use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
+use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, CredentialProvider, DesktopSize};
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::CliprdrServer;
@@ -239,6 +239,7 @@ pub struct RdpServer {
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
     local_addr: Option<SocketAddr>,
 }
 
@@ -306,6 +307,7 @@ impl RdpServer {
             ev_sender,
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
+            credential_provider: None,
             local_addr: None,
         }
     }
@@ -386,6 +388,9 @@ impl RdpServer {
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+        if let Some(ref provider) = self.credential_provider {
+            acceptor.set_credential_provider(Arc::clone(provider));
+        }
 
         self.attach_channels(&mut acceptor);
 
@@ -1115,6 +1120,10 @@ impl RdpServer {
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
         debug!(?creds, "Changing credentials");
         self.creds = creds
+    }
+
+    pub fn set_credential_provider(&mut self, provider: Arc<dyn CredentialProvider>) {
+        self.credential_provider = Some(provider);
     }
 }
 
