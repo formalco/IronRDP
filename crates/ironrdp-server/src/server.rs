@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
+use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, CredsspCandidateProvider, DesktopSize};
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_cliprdr::backend::ClipboardMessage;
@@ -143,8 +143,8 @@ impl core::error::Error for CredentialValidationError {
 /// Server-side credential validator for TLS-mode connections.
 ///
 /// Called during connection setup when the server receives client credentials
-/// via `ClientInfoPdu`. Not used for CredSSP/Hybrid connections (those use
-/// pre-loaded credentials for NTLM challenge-response).
+/// via `ClientInfoPdu`. Not used for CredSSP/Hybrid connections, which resolve
+/// credentials through the acceptor's [`CredsspCandidateProvider`].
 ///
 /// Implement this trait to validate credentials against external systems
 /// (PAM, LDAP, database, etc.). For blocking backends, wrap the call in
@@ -427,6 +427,7 @@ pub struct RdpServer {
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
+    credssp_candidate_provider: Option<Arc<dyn CredsspCandidateProvider>>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
@@ -525,6 +526,7 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             credential_validator: None,
+            credssp_candidate_provider: None,
             local_addr: None,
             autodetect: None,
             connection_handler,
@@ -559,6 +561,15 @@ impl RdpServer {
     /// Not used for CredSSP/Hybrid connections (those use pre-loaded credentials).
     pub fn set_credential_validator(&mut self, validator: Option<Arc<dyn CredentialValidator>>) {
         self.credential_validator = validator;
+    }
+
+    /// Set a provider that resolves candidate credentials for CredSSP/Hybrid
+    /// (NLA) connections at authentication time, keyed on the username the
+    /// client presents. This is the CredSSP counterpart to
+    /// [`set_credential_validator`](RdpServer::set_credential_validator), which
+    /// handles TLS-mode credentials received in the Client Info PDU.
+    pub fn set_credssp_candidate_provider(&mut self, provider: Option<Arc<dyn CredsspCandidateProvider>>) {
+        self.credssp_candidate_provider = provider;
     }
 
     pub fn event_sender(&self) -> &mpsc::UnboundedSender<ServerEvent> {
@@ -711,6 +722,10 @@ impl RdpServer {
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+
+        if let Some(provider) = &self.credssp_candidate_provider {
+            acceptor.set_credssp_candidate_provider(Arc::clone(provider));
+        }
 
         self.attach_channels(&mut acceptor);
 

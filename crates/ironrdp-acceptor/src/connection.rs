@@ -1,4 +1,5 @@
 use core::mem;
+use std::sync::Arc;
 
 use ironrdp_connector::{
     ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize, Sequence, State, Written, encode_x224_packet,
@@ -19,6 +20,7 @@ use tracing::{debug, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::FinalizationSequence;
+use crate::credssp::CredsspCandidateProvider;
 use crate::util::{self, wrap_share_data};
 
 const IO_CHANNEL_ID: u16 = 1003;
@@ -35,6 +37,7 @@ pub struct Acceptor {
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
+    pub(crate) credssp_candidate_provider: Option<Arc<dyn CredsspCandidateProvider>>,
     received_credentials: Option<Credentials>,
     reactivation: bool,
 }
@@ -83,9 +86,16 @@ impl Acceptor {
             static_channels: StaticChannelSet::new(),
             saved_for_reactivation: Default::default(),
             creds,
+            credssp_candidate_provider: None,
             received_credentials: None,
             reactivation: false,
         }
+    }
+
+    /// Resolve candidate credentials for CredSSP/NLA at authentication time,
+    /// instead of the single credential passed to [Acceptor::new].
+    pub fn set_credssp_candidate_provider(&mut self, provider: Arc<dyn CredsspCandidateProvider>) {
+        self.credssp_candidate_provider = Some(provider);
     }
 
     pub fn new_deactivation_reactivation(
@@ -126,6 +136,7 @@ impl Acceptor {
             static_channels,
             saved_for_reactivation,
             creds: consumed.creds,
+            credssp_candidate_provider: consumed.credssp_candidate_provider,
             received_credentials: consumed.received_credentials,
             reactivation: true,
         })
