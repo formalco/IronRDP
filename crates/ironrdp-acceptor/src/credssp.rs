@@ -38,8 +38,21 @@ pub type CredsspProcessGenerator<'a> =
 
 #[derive(Debug)]
 pub struct CredsspSequence<'a> {
-    server: CredSspServer<CredentialsProxyImpl<'a>>,
+    /// Built lazily from `builder` by [CredsspSequence::ensure_server], once the
+    /// client's first token reveals which security mechanism it uses.
+    server: Option<CredSspServer<CredentialsProxyImpl<'a>>>,
+    builder: Option<ServerBuilder<'a>>,
     state: CredsspState,
+}
+
+/// Inputs retained to build the [CredSspServer] lazily, once the client's first
+/// CredSSP token reveals which security mechanism it uses.
+#[derive(Debug)]
+struct ServerBuilder<'a> {
+    credentials: CredentialsProxyImpl<'a>,
+    public_key: Vec<u8>,
+    client_computer_name: String,
+    krb_config: Option<KerberosServerConfig>,
 }
 
 #[derive(Debug)]
@@ -107,28 +120,60 @@ impl<'a> CredsspSequence<'a> {
         public_key: Vec<u8>,
         krb_config: Option<KerberosServerConfig>,
     ) -> ConnectorResult<Self> {
-        let client_computer_name = client_computer_name.into_inner();
-        let credentials = CredentialsProxyImpl::new(creds);
+        Ok(Self {
+            server: None,
+            builder: Some(ServerBuilder {
+                credentials: CredentialsProxyImpl::new(creds),
+                public_key,
+                client_computer_name: client_computer_name.into_inner(),
+                krb_config,
+            }),
+            state: CredsspState::Ongoing,
+        })
+    }
 
-        let server_mode = if let Some(krb_config) = krb_config {
-            ServerMode::Negotiate(NegotiateConfig {
+    /// Builds the CredSSP server from the client's first token.
+    ///
+    /// A Kerberos config selects SPNEGO/Negotiate. Otherwise the mechanism is
+    /// taken from the token: a raw NTLM message (the `NTLMSSP` signature) uses
+    /// NTLM directly, anything else is treated as SPNEGO wrapping NTLM, which is
+    /// what Windows clients send. This lets the acceptor serve them without a
+    /// Kerberos KDC.
+    ///
+    /// Does nothing once the server has been built.
+    fn ensure_server(&mut self, first_token: &[u8]) -> ConnectorResult<()> {
+        let Some(ServerBuilder {
+            credentials,
+            public_key,
+            client_computer_name,
+            krb_config,
+        }) = self.builder.take()
+        else {
+            return Ok(());
+        };
+
+        let server_mode = match krb_config {
+            Some(krb_config) => ServerMode::Negotiate(NegotiateConfig {
                 protocol_config: Box::new(krb_config),
                 package_list: None,
                 client_computer_name,
-            })
-        } else {
-            ServerMode::Ntlm(sspi::ntlm::NtlmConfig::new(client_computer_name))
+            }),
+            None if client_sent_raw_ntlm(first_token) => {
+                ServerMode::Ntlm(sspi::ntlm::NtlmConfig::new(client_computer_name))
+            }
+            None => ServerMode::Negotiate(NegotiateConfig {
+                protocol_config: Box::new(sspi::ntlm::NtlmConfig::new(client_computer_name.clone())),
+                package_list: None,
+                client_computer_name,
+            }),
         };
 
-        let server = CredSspServer::new(public_key, credentials, server_mode)
-            .map_err(|e| ConnectorError::new("CredSSP", ConnectorErrorKind::Credssp(e)))?;
+        self.server = Some(
+            CredSspServer::new(public_key, credentials, server_mode)
+                .map_err(|e| ConnectorError::new("CredSSP", ConnectorErrorKind::Credssp(e)))?,
+        );
 
-        let sequence = Self {
-            server,
-            state: CredsspState::Ongoing,
-        };
-
-        Ok(sequence)
+        Ok(())
     }
 
     /// Returns Some(ts_request) when a TS request is received from client,
@@ -137,6 +182,7 @@ impl<'a> CredsspSequence<'a> {
             CredsspState::Ongoing => {
                 let message = TsRequest::from_buffer(input).map_err(|e| custom_err!("TsRequest", e))?;
                 debug!(?message, "Received");
+                self.ensure_server(message.nego_tokens.as_deref().unwrap_or_default())?;
                 Ok(Some(message))
             }
             _ => Err(general_err!(
@@ -145,8 +191,15 @@ impl<'a> CredsspSequence<'a> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if called before [CredsspSequence::decode_client_message], which
+    /// builds the CredSSP server from the client's first token.
     pub fn process_ts_request(&mut self, request: TsRequest) -> CredsspProcessGenerator<'_> {
-        self.server.process(request)
+        self.server
+            .as_mut()
+            .expect("CredSSP server is built from the client's first message before processing")
+            .process(request)
     }
 
     pub fn handle_process_result(
@@ -179,5 +232,37 @@ impl<'a> CredsspSequence<'a> {
         } else {
             Ok(Written::Nothing)
         }
+    }
+}
+
+/// Whether the client's first CredSSP token is a raw NTLM message rather than
+/// an SPNEGO token. A raw NTLM message begins with the `NTLMSSP\0` signature;
+/// SPNEGO/GSS-API tokens begin with the ASN.1 application tag `0x60`. Anything
+/// that isn't a raw NTLM message is treated as SPNEGO.
+fn client_sent_raw_ntlm(first_token: &[u8]) -> bool {
+    first_token.starts_with(b"NTLMSSP\0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_sent_raw_ntlm;
+
+    #[test]
+    fn raw_ntlm_negotiate_message_is_detected() {
+        // NTLM NEGOTIATE_MESSAGE: "NTLMSSP\0" signature followed by message type 1.
+        assert!(client_sent_raw_ntlm(b"NTLMSSP\x00\x01\x00\x00\x00"));
+    }
+
+    #[test]
+    fn spnego_token_is_not_raw_ntlm() {
+        // SPNEGO NegTokenInit: GSS-API application tag 0x60, then the SPNEGO OID
+        // (1.3.6.1.5.5.2).
+        let spnego = [0x60, 0x82, 0x01, 0x95, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
+        assert!(!client_sent_raw_ntlm(&spnego));
+    }
+
+    #[test]
+    fn empty_token_is_not_raw_ntlm() {
+        assert!(!client_sent_raw_ntlm(&[]));
     }
 }
