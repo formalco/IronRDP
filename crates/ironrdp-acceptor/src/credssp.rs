@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ironrdp_async::NetworkClient;
 use ironrdp_connector::sspi::credssp::{
     CredSspServer, CredentialsProxy, ServerError, ServerMode, ServerState, TsRequest,
@@ -9,7 +11,17 @@ use ironrdp_connector::{
 };
 use ironrdp_core::{WriteBuf, other_err};
 use ironrdp_pdu::PduHint;
+use ironrdp_pdu::rdp::client_info::Credentials;
 use tracing::debug;
+
+/// Resolves candidate credentials for CredSSP/NLA from the presented username.
+///
+/// The NTLM verifier tries each candidate until one matches; return an empty
+/// `Vec` to reject. Called synchronously in the sans-I/O acceptor, so it must
+/// not block.
+pub trait CredsspCandidateProvider: Send + Sync {
+    fn candidates(&self, username: &str, domain: Option<&str>) -> Vec<Credentials>;
+}
 
 #[derive(Debug)]
 pub(crate) enum CredsspState {
@@ -36,39 +48,72 @@ impl PduHint for CredsspTsRequestHint {
 pub type CredsspProcessGenerator<'a> =
     Generator<'a, NetworkRequest, sspi::Result<Vec<u8>>, Result<ServerState, ServerError>>;
 
+/// Credentials for the CredSSP verifier: a pre-loaded identity or a resolver.
+enum CredentialSource {
+    Static(AuthIdentity),
+    Dynamic(Arc<dyn CredsspCandidateProvider>),
+}
+
+impl core::fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Static(identity) => f.debug_tuple("Static").field(identity).finish(),
+            Self::Dynamic(_) => f.debug_tuple("Dynamic").finish(),
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct CredsspSequence<'a> {
-    server: CredSspServer<CredentialsProxyImpl<'a>>,
+pub struct CredsspSequence {
+    server: CredSspServer<CredentialsProxyImpl>,
     state: CredsspState,
 }
 
 #[derive(Debug)]
-struct CredentialsProxyImpl<'a> {
-    credentials: &'a AuthIdentity,
+struct CredentialsProxyImpl {
+    source: CredentialSource,
 }
 
-impl<'a> CredentialsProxyImpl<'a> {
-    fn new(credentials: &'a AuthIdentity) -> Self {
-        Self { credentials }
-    }
-}
-
-impl CredentialsProxy for CredentialsProxyImpl<'_> {
+impl CredentialsProxy for CredentialsProxyImpl {
     type AuthenticationData = AuthIdentity;
 
     fn auth_data_by_user(&mut self, username: &Username) -> std::io::Result<Self::AuthenticationData> {
-        if username.account_name() != self.credentials.username.account_name() {
-            return Err(std::io::Error::other("invalid username"));
-        }
+        self.auth_data_candidates_by_user(username)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("no credentials for user"))
+    }
 
-        let mut data = self.credentials.clone();
-        // keep the original user/domain
-        data.username = username.clone();
-        Ok(data)
+    fn auth_data_candidates_by_user(&mut self, username: &Username) -> std::io::Result<Vec<Self::AuthenticationData>> {
+        match &self.source {
+            CredentialSource::Static(identity) => {
+                if username.account_name() != identity.username.account_name() {
+                    return Err(std::io::Error::other("invalid username"));
+                }
+                let mut data = identity.clone();
+                // keep the original user/domain
+                data.username = username.clone();
+                Ok(vec![data])
+            }
+            CredentialSource::Dynamic(provider) => provider
+                .candidates(username.account_name(), username.domain_name())
+                .into_iter()
+                .map(|c| {
+                    Ok(AuthIdentity {
+                        username: Username::new(&c.username, c.domain.as_deref())
+                            .map_err(|e| std::io::Error::other(e.to_string()))?,
+                        password: c.password.into(),
+                    })
+                })
+                .collect(),
+        }
     }
 
     fn auth_data(&mut self) -> Result<Vec<Self::AuthenticationData>, std::io::Error> {
-        Ok(vec![self.credentials.clone()])
+        match &self.source {
+            CredentialSource::Static(identity) => Ok(vec![identity.clone()]),
+            CredentialSource::Dynamic(_) => Ok(Vec::new()),
+        }
     }
 }
 
@@ -92,7 +137,7 @@ pub(crate) async fn resolve_generator(
     }
 }
 
-impl<'a> CredsspSequence<'a> {
+impl CredsspSequence {
     pub fn next_pdu_hint(&self) -> ConnectorResult<Option<&dyn PduHint>> {
         match &self.state {
             CredsspState::Ongoing => Ok(Some(&CREDSSP_TS_REQUEST_HINT)),
@@ -102,13 +147,43 @@ impl<'a> CredsspSequence<'a> {
     }
 
     pub fn init(
-        creds: &'a AuthIdentity,
+        creds: &AuthIdentity,
+        client_computer_name: ServerName,
+        public_key: Vec<u8>,
+        krb_config: Option<KerberosServerConfig>,
+    ) -> ConnectorResult<Self> {
+        Self::init_impl(
+            CredentialSource::Static(creds.clone()),
+            client_computer_name,
+            public_key,
+            krb_config,
+        )
+    }
+
+    /// Like [CredsspSequence::init], but resolves candidates at authentication
+    /// time through a [CredsspCandidateProvider].
+    pub fn init_with_provider(
+        provider: Arc<dyn CredsspCandidateProvider>,
+        client_computer_name: ServerName,
+        public_key: Vec<u8>,
+        krb_config: Option<KerberosServerConfig>,
+    ) -> ConnectorResult<Self> {
+        Self::init_impl(
+            CredentialSource::Dynamic(provider),
+            client_computer_name,
+            public_key,
+            krb_config,
+        )
+    }
+
+    fn init_impl(
+        source: CredentialSource,
         client_computer_name: ServerName,
         public_key: Vec<u8>,
         krb_config: Option<KerberosServerConfig>,
     ) -> ConnectorResult<Self> {
         let client_computer_name = client_computer_name.into_inner();
-        let credentials = CredentialsProxyImpl::new(creds);
+        let credentials = CredentialsProxyImpl { source };
 
         let server_mode = if let Some(krb_config) = krb_config {
             ServerMode::Negotiate(NegotiateConfig {
