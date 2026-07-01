@@ -19,6 +19,7 @@ use ironrdp_pdu::nego;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{Acceptor, AcceptorResult, AcceptorState};
+pub use self::credssp::CredsspCandidateProvider;
 pub use self::finalization::{FinalizationSequence, FinalizationState};
 use crate::credssp::resolve_generator;
 
@@ -167,18 +168,20 @@ where
         S: FramedRead + FramedWrite,
         N: NetworkClient,
     {
-        let creds = acceptor
-            .creds
-            .as_ref()
-            .ok_or_else(|| general_err!("no credentials while doing credssp"))?;
-        let username = Username::new(&creds.username, None).map_err(|e| custom_err!("invalid username", e))?;
-        let identity = AuthIdentity {
-            username,
-            password: creds.password.clone().into(),
+        let mut sequence = if let Some(provider) = acceptor.credssp_candidate_provider.clone() {
+            credssp::CredsspSequence::init_with_provider(provider, client_computer_name, public_key, kerberos_config)?
+        } else {
+            let creds = acceptor
+                .creds
+                .as_ref()
+                .ok_or_else(|| general_err!("no credentials while doing credssp"))?;
+            let username = Username::new(&creds.username, None).map_err(|e| custom_err!("invalid username", e))?;
+            let identity = AuthIdentity {
+                username,
+                password: creds.password.clone().into(),
+            };
+            credssp::CredsspSequence::init(&identity, client_computer_name, public_key, kerberos_config)?
         };
-
-        let mut sequence =
-            credssp::CredsspSequence::init(&identity, client_computer_name, public_key, kerberos_config)?;
 
         loop {
             let Some(next_pdu_hint) = sequence.next_pdu_hint()? else {
